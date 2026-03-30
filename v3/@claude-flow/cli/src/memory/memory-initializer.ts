@@ -639,6 +639,16 @@ export function clearHNSWIndex(): void {
   hnswIndex = null;
 }
 
+/**
+ * Invalidate the in-memory HNSW cache so the next search rebuilds from DB.
+ * Call this after deleting entries that had embeddings to prevent ghost
+ * vectors from appearing in search results.
+ */
+export function rebuildSearchIndex(): void {
+  hnswIndex = null;
+  hnswInitializing = false;
+}
+
 // ============================================================================
 // INT8 VECTOR QUANTIZATION (4x memory reduction)
 // ============================================================================
@@ -1575,6 +1585,44 @@ export async function loadEmbeddingModel(options?: {
       };
     }
 
+    // Fallback: Check for ruvector ONNX embedder (bundled MiniLM-L6-v2 since v0.2.15)
+    // v0.2.16: LoRA B=0 fix makes AdaptiveEmbedder safe (identity when untrained)
+    // Note: isReady() returns false until first embed() call (lazy init), so we
+    // skip the isReady() gate and verify with a probe embed instead.
+    const ruvector = await import('ruvector').catch(() => null);
+
+    if (ruvector?.initOnnxEmbedder) {
+      try {
+        await ruvector.initOnnxEmbedder();
+
+        // Fallback: OptimizedOnnxEmbedder (raw ONNX, lazy-inits on first embed)
+        const onnxEmb = ruvector.getOptimizedOnnxEmbedder?.();
+        if (onnxEmb?.embed) {
+          // Probe embed to trigger lazy ONNX init and verify it works
+          const probe = await onnxEmb.embed('test');
+          if (probe && probe.length > 0 && (Array.isArray(probe) ? probe.some((v: number) => v !== 0) : true)) {
+            if (verbose) {
+              console.log(`Loading ruvector ONNX embedder (all-MiniLM-L6-v2, ${probe.length}d)...`);
+            }
+            embeddingModelState = {
+              loaded: true,
+              model: (text: string) => onnxEmb.embed(text),
+              tokenizer: null,
+              dimensions: probe.length || 384
+            };
+            return {
+              success: true,
+              dimensions: probe.length || 384,
+              modelName: 'ruvector/onnx',
+              loadTime: Date.now() - startTime
+            };
+          }
+        }
+      } catch {
+        // ruvector ONNX init failed, continue to next fallback
+      }
+    }
+
     // Legacy fallback: Check for agentic-flow core embeddings
     const agenticFlow = await import('agentic-flow').catch(() => null);
 
@@ -1649,12 +1697,17 @@ export async function generateEmbedding(text: string): Promise<{
   if (state.model && typeof (state.model as any) === 'function') {
     try {
       const output = await (state.model as any)(text, { pooling: 'mean', normalize: true });
-      const embedding = Array.from(output.data as Float32Array);
-      return {
-        embedding,
-        dimensions: embedding.length,
-        model: 'onnx'
-      };
+      // Handle both @xenova/transformers (output.data) and ruvector (plain array) formats
+      const embedding = output?.data
+        ? Array.from(output.data as Float32Array)
+        : Array.isArray(output) ? output : null;
+      if (embedding) {
+        return {
+          embedding,
+          dimensions: embedding.length,
+          model: 'onnx'
+        };
+      }
     } catch {
       // Fall through to fallback
     }
@@ -2169,13 +2222,20 @@ export async function searchEntries(options: {
     const db = new SQL.Database(fileBuffer);
 
     // Get entries with embeddings
-    const entries = db.exec(`
-      SELECT id, key, namespace, content, embedding
-      FROM memory_entries
-      WHERE status = 'active'
-        ${namespace !== 'all' ? `AND namespace = '${namespace.replace(/'/g, "''")}'` : ''}
-      LIMIT 1000
-    `);
+    const searchStmt = db.prepare(
+      namespace !== 'all'
+        ? `SELECT id, key, namespace, content, embedding FROM memory_entries WHERE status = 'active' AND namespace = ? LIMIT 1000`
+        : `SELECT id, key, namespace, content, embedding FROM memory_entries WHERE status = 'active' LIMIT 1000`
+    );
+    if (namespace !== 'all') {
+      searchStmt.bind([namespace]);
+    }
+    const searchRows: unknown[][] = [];
+    while (searchStmt.step()) {
+      searchRows.push(searchStmt.get());
+    }
+    searchStmt.free();
+    const entries = searchRows.length > 0 ? [{ values: searchRows }] : [];
 
     const results: { id: string; key: string; content: string; score: number; namespace: string }[] = [];
 
@@ -2316,24 +2376,37 @@ export async function listEntries(options: {
     const db = new SQL.Database(fileBuffer);
 
     // Get total count
-    const countQuery = namespace
-      ? `SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active' AND namespace = '${namespace.replace(/'/g, "''")}'`
-      : `SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active'`;
-
-    const countResult = db.exec(countQuery);
+    const countStmt = namespace
+      ? db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active' AND namespace = ?`)
+      : db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active'`);
+    if (namespace) {
+      countStmt.bind([namespace]);
+    }
+    const countRows: unknown[][] = [];
+    while (countStmt.step()) {
+      countRows.push(countStmt.get());
+    }
+    countStmt.free();
+    const countResult = countRows.length > 0 ? [{ values: countRows }] : [];
     const total = countResult[0]?.values?.[0]?.[0] as number || 0;
 
     // Get entries
-    const listQuery = `
-      SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at
-      FROM memory_entries
-      WHERE status = 'active'
-        ${namespace ? `AND namespace = '${namespace.replace(/'/g, "''")}'` : ''}
-      ORDER BY updated_at DESC
-      LIMIT ${limit} OFFSET ${offset}
-    `;
-
-    const result = db.exec(listQuery);
+    const safeLimit = parseInt(String(limit), 10) || 100;
+    const safeOffset = parseInt(String(offset), 10) || 0;
+    const listStmt = namespace
+      ? db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE status = 'active' AND namespace = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+      : db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE status = 'active' ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
+    if (namespace) {
+      listStmt.bind([namespace, safeLimit, safeOffset]);
+    } else {
+      listStmt.bind([safeLimit, safeOffset]);
+    }
+    const listRows: unknown[][] = [];
+    while (listStmt.step()) {
+      listRows.push(listStmt.get());
+    }
+    listStmt.free();
+    const result = listRows.length > 0 ? [{ values: listRows }] : [];
     const entries: {
       id: string;
       key: string;
@@ -2431,14 +2504,21 @@ export async function getEntry(options: {
     const db = new SQL.Database(fileBuffer);
 
     // Find entry by key
-    const result = db.exec(`
+    const getStmt = db.prepare(`
       SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at, tags
       FROM memory_entries
       WHERE status = 'active'
-        AND key = '${key.replace(/'/g, "''")}'
-        AND namespace = '${namespace.replace(/'/g, "''")}'
+        AND key = ?
+        AND namespace = ?
       LIMIT 1
     `);
+    getStmt.bind([key, namespace]);
+    const getRows: unknown[][] = [];
+    while (getStmt.step()) {
+      getRows.push(getStmt.get());
+    }
+    getStmt.free();
+    const result = getRows.length > 0 ? [{ values: getRows }] : [];
 
     if (!result[0]?.values?.[0]) {
       db.close();
@@ -2453,8 +2533,8 @@ export async function getEntry(options: {
     db.run(`
       UPDATE memory_entries
       SET access_count = access_count + 1, last_accessed_at = strftime('%s', 'now') * 1000
-      WHERE id = '${String(id).replace(/'/g, "''")}'
-    `);
+      WHERE id = ?
+    `, [String(id)]);
 
     // Save updated database
     const data = db.export();
@@ -2515,7 +2595,22 @@ export async function deleteEntry(options: {
   const bridge = await getBridge();
   if (bridge) {
     const bridgeResult = await bridge.bridgeDeleteEntry(options);
-    if (bridgeResult) return bridgeResult;
+    if (bridgeResult) {
+      // #1122: Bridge path must also invalidate the in-memory HNSW index.
+      // Without this, deleted vectors remain as ghost entries in search results.
+      if (bridgeResult.deleted && hnswIndex?.entries) {
+        // Remove the entry from the HNSW entries map by key+namespace composite
+        for (const [id, entry] of hnswIndex.entries) {
+          if ((entry as any)?.key === options.key && ((entry as any)?.namespace ?? 'default') === (options.namespace ?? 'default')) {
+            hnswIndex.entries.delete(id);
+            break;
+          }
+        }
+        saveHNSWMetadata();
+        rebuildSearchIndex();
+      }
+      return bridgeResult;
+    }
   }
 
   // Fallback: raw sql.js
@@ -2550,13 +2645,20 @@ export async function deleteEntry(options: {
     const db = new SQL.Database(fileBuffer);
 
     // Check if entry exists first
-    const checkResult = db.exec(`
+    const checkStmt = db.prepare(`
       SELECT id FROM memory_entries
       WHERE status = 'active'
-        AND key = '${key.replace(/'/g, "''")}'
-        AND namespace = '${namespace.replace(/'/g, "''")}'
+        AND key = ?
+        AND namespace = ?
       LIMIT 1
     `);
+    checkStmt.bind([key, namespace]);
+    const checkRows: unknown[][] = [];
+    while (checkStmt.step()) {
+      checkRows.push(checkStmt.get());
+    }
+    checkStmt.free();
+    const checkResult = checkRows.length > 0 ? [{ values: checkRows }] : [];
 
     if (!checkResult[0]?.values?.[0]) {
       // Get remaining count before closing
@@ -2573,14 +2675,20 @@ export async function deleteEntry(options: {
       };
     }
 
+    // Capture the entry ID for HNSW cleanup
+    const entryId = String(checkResult[0].values[0][0]);
+
     // Delete the entry (soft delete by setting status to 'deleted')
+    // Also null out the embedding to clean up vector data from SQLite
     db.run(`
       UPDATE memory_entries
-      SET status = 'deleted', updated_at = strftime('%s', 'now') * 1000
-      WHERE key = '${key.replace(/'/g, "''")}'
-        AND namespace = '${namespace.replace(/'/g, "''")}'
+      SET status = 'deleted',
+          embedding = NULL,
+          updated_at = strftime('%s', 'now') * 1000
+      WHERE key = ?
+        AND namespace = ?
         AND status = 'active'
-    `);
+    `, [key, namespace]);
 
     // Get remaining count
     const countResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE status = 'active'`);
@@ -2591,6 +2699,18 @@ export async function deleteEntry(options: {
     fs.writeFileSync(dbPath, Buffer.from(data));
 
     db.close();
+
+    // Clean up in-memory HNSW index so ghost vectors don't appear in searches.
+    // Remove the entry from the HNSW entries map and invalidate the index.
+    // The next search will rebuild the HNSW index from the remaining DB rows.
+    if (hnswIndex?.entries) {
+      hnswIndex.entries.delete(entryId);
+      saveHNSWMetadata();
+      // Invalidate the HNSW index so it rebuilds from DB on next search.
+      // We can't surgically remove a vector from the HNSW graph, so we
+      // clear the entire index; it will be lazily rebuilt from SQLite.
+      rebuildSearchIndex();
+    }
 
     return {
       success: true,
@@ -2625,6 +2745,7 @@ export default {
   listEntries,
   getEntry,
   deleteEntry,
+  rebuildSearchIndex,
   MEMORY_SCHEMA_V3,
   getInitialMetadata
 };

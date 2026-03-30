@@ -44,7 +44,7 @@ function getConfigPath(): string {
 function ensureConfigDir(): void {
   const dir = getConfigDir();
   if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 }
 
@@ -85,8 +85,29 @@ function getNestedValue(obj: Record<string, unknown>, key: string): unknown {
   return current;
 }
 
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function filterDangerousKeys(obj: Record<string, unknown>): Record<string, unknown> {
+  const filtered: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (!DANGEROUS_KEYS.has(key)) {
+      filtered[key] = value;
+    }
+  }
+  return filtered;
+}
+
 function setNestedValue(obj: Record<string, unknown>, key: string, value: unknown): void {
+  const MAX_NESTING_DEPTH = 10;
   const parts = key.split('.');
+  if (parts.length > MAX_NESTING_DEPTH) {
+    throw new Error(`Key exceeds maximum nesting depth of ${MAX_NESTING_DEPTH}`);
+  }
+  for (const part of parts) {
+    if (DANGEROUS_KEYS.has(part)) {
+      throw new Error(`Dangerous key segment rejected: ${part}`);
+    }
+  }
   let current = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const part = parts[i];
@@ -337,7 +358,7 @@ export const configTools: MCPTool[] = [
     },
     handler: async (input) => {
       const store = loadConfigStore();
-      const config = input.config as Record<string, unknown>;
+      const config = filterDangerousKeys(input.config as Record<string, unknown>);
       const scope = (input.scope as string) || 'default';
       const merge = input.merge !== false;
 

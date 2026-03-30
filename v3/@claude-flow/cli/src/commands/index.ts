@@ -2,8 +2,11 @@
  * V3 CLI Commands Index
  * Central registry for all CLI commands
  *
- * OPTIMIZATION: Uses lazy loading for commands to reduce CLI startup time by ~200ms
- * Commands are loaded on-demand when first accessed, not at module load time.
+ * NOTE: All commands are synchronously imported at module load time (lines below).
+ * The commandLoaders/loadCommand infrastructure provides an async fallback for
+ * commands looked up via getCommandAsync() but does NOT reduce startup time since
+ * all modules are already imported synchronously for the commands array and
+ * commandsByCategory exports.
  */
 
 import type { Command } from '../types.js';
@@ -67,6 +70,10 @@ const commandLoaders: Record<string, CommandLoader> = {
   guidance: () => import('./guidance.js'),
   // RVFA Appliance Management
   appliance: () => import('./appliance.js'),
+  'appliance-advanced': () => import('./appliance-advanced.js'),
+  'transfer-store': () => import('./transfer-store.js'),
+  cleanup: () => import('./cleanup.js'),
+  autopilot: () => import('./autopilot.js'),
 };
 
 // Cache for loaded commands
@@ -143,6 +150,8 @@ import updateCommand from './update.js';
 import { processCommand } from './process.js';
 import { guidanceCommand } from './guidance.js';
 import { applianceCommand } from './appliance.js';
+import { cleanupCommand } from './cleanup.js';
+import { autopilotCommand } from './autopilot.js';
 
 // Pre-populate cache with core commands
 loadedCommands.set('init', initCommand);
@@ -164,6 +173,8 @@ loadedCommands.set('security', securityCommand);
 loadedCommands.set('ruvector', ruvectorCommand);
 loadedCommands.set('hive-mind', hiveMindCommand);
 loadedCommands.set('guidance', guidanceCommand);
+loadedCommands.set('cleanup', cleanupCommand);
+loadedCommands.set('autopilot', autopilotCommand);
 
 // =============================================================================
 // Exports (maintain backwards compatibility)
@@ -190,6 +201,8 @@ export { ruvectorCommand } from './ruvector/index.js';
 export { hiveMindCommand } from './hive-mind.js';
 export { guidanceCommand } from './guidance.js';
 export { applianceCommand } from './appliance.js';
+export { cleanupCommand } from './cleanup.js';
+export { autopilotCommand } from './autopilot.js';
 
 // Lazy-loaded command re-exports (for backwards compatibility, but async-only)
 export async function getConfigCommand() { return loadCommand('config'); }
@@ -215,6 +228,8 @@ export async function getIssuesCommand() { return loadCommand('issues'); }
 export async function getRuvectorCommand() { return loadCommand('ruvector'); }
 export async function getGuidanceCommand() { return loadCommand('guidance'); }
 export async function getApplianceCommand() { return loadCommand('appliance'); }
+export async function getCleanupCommand() { return loadCommand('cleanup'); }
+export async function getAutopilotCommand() { return loadCommand('autopilot'); }
 
 /**
  * Core commands loaded synchronously (available immediately)
@@ -241,6 +256,8 @@ export const commands: Command[] = [
   ruvectorCommand,
   hiveMindCommand,
   guidanceCommand,
+  cleanupCommand,
+  autopilotCommand,
 ];
 
 /**
@@ -267,6 +284,7 @@ export const commandsByCategory = {
     hiveMindCommand,
     ruvectorCommand,
     guidanceCommand,
+    autopilotCommand,
   ],
   utility: [
     configCommand,
@@ -290,6 +308,7 @@ export const commandsByCategory = {
     updateCommand,
     processCommand,
     applianceCommand,
+    cleanupCommand,
   ],
 };
 
